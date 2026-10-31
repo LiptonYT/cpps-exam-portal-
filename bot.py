@@ -49,10 +49,15 @@ CREATE TABLE IF NOT EXISTS applications (
     review_message_id INTEGER,
     reviewer_id INTEGER,
     created_at TEXT NOT NULL,
-    reviewed_at TEXT
+    reviewed_at TEXT,
+    member_joined_at TEXT
 )
 """)
 db.commit()
+columns = {row["name"] for row in db.execute("PRAGMA table_info(applications)").fetchall()}
+if "member_joined_at" not in columns:
+    db.execute("ALTER TABLE applications ADD COLUMN member_joined_at TEXT")
+    db.commit()
 
 
 def reviewer_allowed(member: discord.Member) -> bool:
@@ -61,31 +66,58 @@ def reviewer_allowed(member: discord.Member) -> bool:
     return any(role.id in REVIEWER_ROLE_IDS for role in member.roles)
 
 
-def make_embed(row, status="pending"):
+def make_embed(row, status="pending", member=None):
     colors = {
-        "pending": discord.Color.orange(),
+        "pending": discord.Color.from_rgb(230, 160, 55),
         "approved": discord.Color.green(),
         "rejected": discord.Color.red(),
     }
     labels = {
         "pending": "Ожидает рассмотрения",
-        "approved": "Одобрено — сотрудник уволен",
+        "approved": "Одобрено",
         "rejected": "Отклонено",
     }
     embed = discord.Embed(
-        title=f"Заявление на увольнение №{row['id']}",
+        title=f"Заявление на увольнение #{row['id']}",
         color=colors.get(status, discord.Color.dark_grey()),
         timestamp=datetime.fromisoformat(row["created_at"])
     )
-    embed.add_field(name="Пользователь Discord", value=f"<@{row['user_id']}> (`{row['user_id']}`)", inline=False)
-    embed.add_field(name="Игровой никнейм", value=row["game_nick"], inline=True)
-    embed.add_field(name="Static ID", value=row["static_id"], inline=True)
-    embed.add_field(name="Текущее звание", value=row["rank"], inline=True)
-    embed.add_field(name="Причина увольнения", value=row["reason"], inline=False)
-    embed.add_field(name="Статус", value=labels.get(status, status), inline=False)
+    user_line = f"**Пользователь:** <@{row['user_id']}>"
+    if member is not None:
+        joined_at = member.joined_at
+        if joined_at:
+            stamp = int(joined_at.timestamp())
+            user_line += f"\n**Присоединился:** <t:{stamp}:F> (<t:{stamp}:R>)"
+        embed.set_thumbnail(url=member.display_avatar.url)
+    embed.description = f"{user_line}\n**ID:** `{row['static_id']}`"
+
+    role_mentions = " ".join(f"<@&{role_id}>" for role_id in sorted(REVIEWER_ROLE_IDS))
+    header = (
+        "Начальнику Управления ГИБДД ГУ МВД по г. Москве и Московской области "
+        "Генерал-полковнику полиции"
+    )
+    if role_mentions:
+        header += f"\n{role_mentions}"
+    embed.add_field(name="", value=header, inline=False)
+    embed.add_field(name="", value=f"от **{row['rank']}** **{row['game_nick']}**", inline=False)
+    embed.add_field(
+        name="Заявление",
+        value=(
+            f"Я, **{row['game_nick']}**, находящийся в звании **{row['rank']}**, "
+            f"служебное удостоверение №`{row['static_id']}` прошу Вас рассмотреть "
+            "моё заявление на увольнение из рядов Управления Государственной "
+            "Инспекции Безопасности Дорожного Движения по причине:\n"
+            f"{row['reason']}"
+        ),
+        inline=False
+    )
+    from zoneinfo import ZoneInfo
+    created_local = datetime.fromisoformat(row["created_at"]).astimezone(ZoneInfo("Europe/Moscow"))
+    embed.add_field(name="", value=f"**Дата:** {created_local:%d.%m.%Y}", inline=False)
+    embed.add_field(name="Статус", value=f"**{labels.get(status, status)}**", inline=False)
     if row["reviewer_id"]:
         embed.add_field(name="Рассмотрел", value=f"<@{row['reviewer_id']}>", inline=False)
-    embed.set_footer(text="ГИБДД | RMRP «Тверской» • Система увольнений")
+    embed.set_footer(text="ГИБДД | RMRP «Тверской»")
     return embed
 
 
@@ -126,17 +158,24 @@ class ResignationModal(discord.ui.Modal, title="Заявление на увол
         created = datetime.now(timezone.utc).isoformat()
         cur = db.execute(
             """INSERT INTO applications
-            (guild_id,user_id,game_nick,static_id,rank,reason,created_at)
-            VALUES (?,?,?,?,?,?,?)""",
+            (guild_id,user_id,game_nick,static_id,rank,reason,created_at,member_joined_at)
+            VALUES (?,?,?,?,?,?,?,?)""",
             (interaction.guild.id, interaction.user.id, str(self.game_nick),
-             str(self.static_id), str(self.rank), str(self.reason), created)
+             str(self.static_id), str(self.rank), str(self.reason), created,
+             interaction.user.joined_at.isoformat() if interaction.user.joined_at else None)
         )
         app_id = cur.lastrowid
         db.commit()
         row = db.execute("SELECT * FROM applications WHERE id=?", (app_id,)).fetchone()
 
         try:
-            message = await channel.send(embed=make_embed(row), view=ReviewView(app_id))
+            applicant_role_ping = " ".join(f"<@&{role_id}>" for role_id in sorted(REVIEWER_ROLE_IDS))
+            message = await channel.send(
+                content=applicant_role_ping or None,
+                embed=make_embed(row, member=interaction.user),
+                view=ReviewView(app_id),
+                allowed_mentions=discord.AllowedMentions(roles=True, users=False)
+            )
             db.execute("UPDATE applications SET review_message_id=? WHERE id=?",
                        (message.id, app_id))
             db.commit()
@@ -251,7 +290,8 @@ class ReviewView(discord.ui.View):
         )
         db.commit()
         updated = db.execute("SELECT * FROM applications WHERE id=?", (self.application_id,)).fetchone()
-        await interaction.response.edit_message(embed=make_embed(updated, status), view=None)
+        card_member = guild.get_member(row["user_id"])
+        await interaction.response.edit_message(embed=make_embed(updated, status, card_member), view=None)
         if extra:
             await interaction.followup.send(extra, ephemeral=True)
 
